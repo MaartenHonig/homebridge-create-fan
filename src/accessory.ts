@@ -1,0 +1,554 @@
+import {
+  Characteristic,
+  CharacteristicValue,
+  type Logging,
+  PlatformAccessory,
+  Service,
+} from 'homebridge';
+import { HomebridgeCreateCeilingFan } from './platform.js';
+import type { PlatformAccessoryContext, DpsMapping, FeatureFlags } from './types.js';
+import { percentToStep, stepToPercent } from './mapping.js';
+import {
+  MOMENTARY_RESET_DELAY,
+  DPS_PULSE_DELAY,
+  MAX_RECONNECT_DELAY,
+  INITIAL_RECONNECT_DELAY,
+} from './settings.js';
+import TuyAPI from 'tuyapi';
+import type TuyaDevice from 'tuyapi';
+import type { DPSObject } from 'tuyapi';
+
+export class FanAccessory {
+  private readonly Characteristic: typeof Characteristic;
+  private readonly log: Logging;
+  private readonly tuyaDevice: TuyaDevice;
+  private readonly mapping: DpsMapping;
+  private readonly features: FeatureFlags;
+  private readonly deviceName: string;
+
+  // Services
+  private readonly fanService: Service;
+  private lightService?: Service;
+  private tempSwitches: Service[] = [];
+  private timerSwitches: Service[] = [];
+
+  // Connection state
+  private isConnecting = false;
+  private isConnected = false;
+  private reconnectDelay = INITIAL_RECONNECT_DELAY;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private pollTimer?: ReturnType<typeof setInterval>;
+
+  // Device state cache
+  private state = {
+    fanActive: false,
+    fanSpeed: 1,
+    fanDirection: 0, // 0 = clockwise, 1 = counter-clockwise
+    lightOn: false,
+    currentTempIndex: 0, // index into lightTempValues
+  };
+
+  // Debounce: prevent re-entrant HomeKit updates within a window
+  private lastUpdateTime = 0;
+  private readonly UPDATE_DEBOUNCE_MS = 200;
+
+  constructor(
+    private readonly platform: HomebridgeCreateCeilingFan,
+    private readonly accessory: PlatformAccessory<PlatformAccessoryContext>,
+  ) {
+    this.Characteristic = this.platform.Characteristic;
+    this.log = this.platform.log;
+    this.mapping = accessory.context.device.mapping;
+    this.features = accessory.context.device.features;
+    this.deviceName = accessory.context.device.name;
+
+    this.log.info(`[${this.deviceName}]`, 'Initializing accessory…');
+
+    // ── Accessory Information ────────────────────────────────────
+    this.accessory
+      .getService(this.platform.Service.AccessoryInformation)!
+      .setCharacteristic(this.Characteristic.Manufacturer, 'CREATE')
+      .setCharacteristic(this.Characteristic.Model, accessory.context.device.model)
+      .setCharacteristic(this.Characteristic.Name, this.deviceName)
+      .setCharacteristic(this.Characteristic.SerialNumber, accessory.context.device.id);
+
+    // ── Fan Service (FanV2) ──────────────────────────────────────
+    this.fanService =
+      this.accessory.getService(this.platform.Service.Fanv2) ||
+      this.accessory.addService(this.platform.Service.Fanv2);
+    this.fanService.setCharacteristic(this.Characteristic.Name, this.deviceName);
+
+    this.fanService
+      .getCharacteristic(this.Characteristic.Active)
+      .onGet(() => this.state.fanActive ? 1 : 0)
+      .onSet(this.setFanActive.bind(this));
+
+    this.fanService
+      .getCharacteristic(this.Characteristic.RotationSpeed)
+      .setProps({ minValue: 0, maxValue: 100, minStep: Math.round(100 / (this.mapping.fanSpeedMax - this.mapping.fanSpeedMin + 1)) })
+      .onGet(() => stepToPercent(this.state.fanSpeed, this.mapping.fanSpeedMin, this.mapping.fanSpeedMax))
+      .onSet(this.setFanSpeed.bind(this));
+
+    if (this.features.enableDirection && this.mapping.fanDirectionDps !== undefined) {
+      this.fanService
+        .getCharacteristic(this.Characteristic.RotationDirection)
+        .onGet(() => this.state.fanDirection)
+        .onSet(this.setFanDirection.bind(this));
+    }
+
+    // ── Light Service ────────────────────────────────────────────
+    if (this.features.enableLight) {
+      this.lightService =
+        this.accessory.getService(this.platform.Service.Lightbulb) ||
+        this.accessory.addService(this.platform.Service.Lightbulb);
+      this.lightService.setCharacteristic(this.Characteristic.Name, `${this.deviceName} Light`);
+
+      this.lightService
+        .getCharacteristic(this.Characteristic.On)
+        .onGet(() => this.state.lightOn)
+        .onSet(this.setLightOn.bind(this));
+    } else {
+      // Remove light service if it was previously cached but now disabled
+      const existing = this.accessory.getService(this.platform.Service.Lightbulb);
+      if (existing) {
+        this.accessory.removeService(existing);
+      }
+    }
+
+    // ── Temperature Preset Buttons ───────────────────────────────
+    this.setupTempButtons();
+
+    // ── Timer Preset Buttons ─────────────────────────────────────
+    this.setupTimerButtons();
+
+    // ── Remove legacy toggle switch if present ───────────────────
+    this.cleanupLegacyServices();
+
+    // ── Tuya device ──────────────────────────────────────────────
+    this.tuyaDevice = new TuyAPI({
+      id: accessory.context.device.id,
+      key: accessory.context.device.key,
+    });
+
+    this.tuyaDevice.on('connected', () => {
+      this.log.info(`[${this.deviceName}]`, 'Connected');
+      this.isConnected = true;
+      this.isConnecting = false;
+      this.reconnectDelay = INITIAL_RECONNECT_DELAY;
+      this.refreshState();
+      this.startPolling();
+    });
+
+    this.tuyaDevice.on('disconnected', () => {
+      this.log.info(`[${this.deviceName}]`, 'Disconnected');
+      this.isConnected = false;
+      this.stopPolling();
+      this.scheduleReconnect();
+    });
+
+    this.tuyaDevice.on('error', (error: Error) => {
+      this.log.warn(`[${this.deviceName}]`, `Error: ${error.message}`);
+    });
+
+    this.tuyaDevice.on('dp-refresh', (data: DPSObject, _cmd: number, _seq: number) => this.handleData(data));
+    this.tuyaDevice.on('data', (data: DPSObject, _cmd: number, _seq: number) => this.handleData(data));
+
+    this.connect();
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  CONNECTION MANAGEMENT
+  // ════════════════════════════════════════════════════════════════
+
+  private async connect() {
+    if (this.isConnecting || this.isConnected) {
+      return;
+    }
+    this.isConnecting = true;
+    this.log.info(`[${this.deviceName}]`, 'Connecting…');
+
+    try {
+      await this.tuyaDevice.find();
+      await this.tuyaDevice.connect();
+    } catch (err) {
+      this.isConnecting = false;
+      this.log.warn(`[${this.deviceName}]`, `Connection failed: ${err}`);
+      this.scheduleReconnect();
+    }
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectTimer) {
+      return;
+    }
+    this.log.debug(`[${this.deviceName}]`, `Reconnecting in ${this.reconnectDelay / 1000}s…`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.connect();
+    }, this.reconnectDelay);
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY);
+  }
+
+  private startPolling() {
+    this.stopPolling();
+    const interval = this.platform.pollingInterval;
+    if (interval > 0) {
+      this.pollTimer = setInterval(() => this.refreshState(), interval);
+      this.log.debug(`[${this.deviceName}]`, `Polling every ${interval / 1000}s`);
+    }
+  }
+
+  private stopPolling() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  STATE SYNC
+  // ════════════════════════════════════════════════════════════════
+
+  private async refreshState() {
+    if (!this.isConnected) {
+      return;
+    }
+    try {
+      // dp-refresh triggers the data event with all DPS values
+      await this.tuyaDevice.refresh({ schema: true });
+    } catch (err) {
+      this.log.debug(`[${this.deviceName}]`, `Refresh failed: ${err}`);
+    }
+  }
+
+  private handleData(data: DPSObject) {
+    if (!data?.dps) {
+      return;
+    }
+
+    // Cast tuyapi's loose Object type to a usable Record
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dps = data.dps as unknown as Record<string, any>;
+
+    const now = Date.now();
+    if (now - this.lastUpdateTime < this.UPDATE_DEBOUNCE_MS) {
+      this.applyDps(dps, false);
+      return;
+    }
+    this.lastUpdateTime = now;
+    this.applyDps(dps, true);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private applyDps(dps: Record<string, any>, pushToHomeKit: boolean) {
+    const m = this.mapping;
+
+    // Fan power
+    const fanPower = dps[String(m.fanPowerDps)];
+    if (fanPower !== undefined) {
+      this.state.fanActive = !!fanPower;
+      if (pushToHomeKit) {
+        this.fanService.updateCharacteristic(
+          this.Characteristic.Active,
+          this.state.fanActive ? 1 : 0,
+        );
+      }
+    }
+
+    // Fan speed
+    const fanSpeed = dps[String(m.fanSpeedDps)];
+    if (fanSpeed !== undefined) {
+      this.state.fanSpeed = Number(fanSpeed);
+      if (pushToHomeKit) {
+        this.fanService.updateCharacteristic(
+          this.Characteristic.RotationSpeed,
+          stepToPercent(this.state.fanSpeed, m.fanSpeedMin, m.fanSpeedMax),
+        );
+      }
+    }
+
+    // Fan direction
+    if (m.fanDirectionDps !== undefined) {
+      const dir = dps[String(m.fanDirectionDps)];
+      if (dir !== undefined) {
+        // Device may use string "forward"/"reverse", bool, or number
+        this.state.fanDirection = this.parseDirection(dir);
+        if (pushToHomeKit && this.features.enableDirection) {
+          this.fanService.updateCharacteristic(
+            this.Characteristic.RotationDirection,
+            this.state.fanDirection,
+          );
+        }
+      }
+    }
+
+    // Light power
+    const lightPower = dps[String(m.lightPowerDps)];
+    if (lightPower !== undefined) {
+      this.state.lightOn = !!lightPower;
+      if (pushToHomeKit && this.lightService) {
+        this.lightService.updateCharacteristic(this.Characteristic.On, this.state.lightOn);
+      }
+    }
+
+    // Light temperature mode (readable)
+    if (m.lightTempModeDps !== undefined) {
+      const tempMode = dps[String(m.lightTempModeDps)];
+      if (tempMode !== undefined) {
+        const idx = m.lightTempValues.indexOf(Number(tempMode));
+        if (idx >= 0) {
+          this.state.currentTempIndex = idx;
+        }
+      }
+    }
+
+    this.log.debug(
+      `[${this.deviceName}]`,
+      `State: fan=${this.state.fanActive ? 'ON' : 'OFF'} speed=${this.state.fanSpeed} ` +
+      `light=${this.state.lightOn ? 'ON' : 'OFF'} temp=${this.state.currentTempIndex}`,
+    );
+  }
+
+  private parseDirection(value: boolean | number | string): number {
+    if (typeof value === 'boolean') {
+      return value ? 1 : 0;
+    }
+    if (typeof value === 'string') {
+      return value === 'reverse' || value === '1' ? 1 : 0;
+    }
+    return value ? 1 : 0;
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  TUYA COMMAND HELPER
+  // ════════════════════════════════════════════════════════════════
+
+  private sendCommand(dps: number, value: string | number | boolean) {
+    this.log.debug(`[${this.deviceName}]`, `sendCommand(dps=${dps}, value=${value})`);
+    if (!this.isConnected) {
+      this.log.warn(`[${this.deviceName}]`, 'Not connected – command dropped');
+      return;
+    }
+    this.tuyaDevice.set({ dps, set: value });
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  FAN HANDLERS
+  // ════════════════════════════════════════════════════════════════
+
+  private setFanActive(value: CharacteristicValue) {
+    // BUG FIX: use the incoming value directly instead of toggling
+    const active = value === 1;
+    this.state.fanActive = active;
+    this.sendCommand(this.mapping.fanPowerDps, active);
+    this.log.debug(`[${this.deviceName}]`, `setFanActive → ${active ? 'ACTIVE' : 'INACTIVE'}`);
+  }
+
+  private setFanSpeed(value: CharacteristicValue) {
+    const percent = value as number;
+    const step = percentToStep(percent, this.mapping.fanSpeedMin, this.mapping.fanSpeedMax);
+    this.state.fanSpeed = step;
+    this.sendCommand(this.mapping.fanSpeedDps, step);
+
+    // If fan was off and user sets speed, turn it on
+    if (!this.state.fanActive && percent > 0) {
+      this.state.fanActive = true;
+      this.sendCommand(this.mapping.fanPowerDps, true);
+      this.fanService.updateCharacteristic(this.Characteristic.Active, 1);
+    }
+
+    this.log.debug(`[${this.deviceName}]`, `setFanSpeed → ${percent}% (step ${step})`);
+  }
+
+  private setFanDirection(value: CharacteristicValue) {
+    const dir = value as number;
+    this.state.fanDirection = dir;
+    // Send as boolean or number depending on device. Most Tuya fans use bool or string.
+    if (this.mapping.fanDirectionDps !== undefined) {
+      this.sendCommand(this.mapping.fanDirectionDps, dir === 1 ? 'reverse' : 'forward');
+    }
+    this.log.debug(`[${this.deviceName}]`, `setFanDirection → ${dir === 0 ? 'CW' : 'CCW'}`);
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  LIGHT HANDLERS
+  // ════════════════════════════════════════════════════════════════
+
+  private setLightOn(value: CharacteristicValue) {
+    const on = value as boolean;
+    this.state.lightOn = on;
+    this.sendCommand(this.mapping.lightPowerDps, on);
+    this.log.debug(`[${this.deviceName}]`, `setLightOn → ${on ? 'ON' : 'OFF'}`);
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  TEMPERATURE PRESET BUTTONS
+  // ════════════════════════════════════════════════════════════════
+
+  private setupTempButtons() {
+    if (!this.features.enableTempButtons || !this.features.enableLight) {
+      // Remove any previously cached temp switches
+      for (let i = 0; i < 3; i++) {
+        const existing = this.accessory.getService(`Light Temp ${i + 1}`);
+        if (existing) {
+          this.accessory.removeService(existing);
+        }
+      }
+      return;
+    }
+
+    const values = this.mapping.lightTempValues;
+    for (let i = 0; i < values.length; i++) {
+      const name = `Light Temp ${i + 1}`;
+      const subtype = `temp-preset-${i}`;
+      const svc =
+        this.accessory.getService(name) ||
+        this.accessory.addService(this.platform.Service.Switch, name, subtype);
+      svc.setCharacteristic(this.Characteristic.Name, name);
+
+      svc
+        .getCharacteristic(this.Characteristic.On)
+        .onGet(() => false) // always off (momentary)
+        .onSet((value: CharacteristicValue) => {
+          if (value) {
+            this.activateTempPreset(i, svc);
+          }
+        });
+
+      this.tempSwitches.push(svc);
+    }
+  }
+
+  private async activateTempPreset(targetIndex: number, svc: Service) {
+    const m = this.mapping;
+
+    // Method A: Direct mode DPS
+    if (m.lightTempModeDps !== undefined) {
+      this.sendCommand(m.lightTempModeDps, m.lightTempValues[targetIndex]);
+      this.state.currentTempIndex = targetIndex;
+    }
+    // Method B: Cycle
+    else {
+      const totalModes = m.lightTempValues.length;
+      let cyclesToDo = (targetIndex - this.state.currentTempIndex + totalModes) % totalModes;
+      if (cyclesToDo === 0) {
+        cyclesToDo = totalModes; // full cycle to re-apply same mode
+      }
+      const maxCycles = totalModes; // safety cap
+      cyclesToDo = Math.min(cyclesToDo, maxCycles);
+
+      for (let c = 0; c < cyclesToDo; c++) {
+        await this.performTempCycle();
+        if (c < cyclesToDo - 1) {
+          await this.delay(DPS_PULSE_DELAY);
+        }
+      }
+      this.state.currentTempIndex = targetIndex;
+    }
+
+    // Reset momentary switch
+    setTimeout(() => {
+      svc.updateCharacteristic(this.Characteristic.On, false);
+    }, MOMENTARY_RESET_DELAY);
+
+    this.log.debug(
+      `[${this.deviceName}]`,
+      `Temp preset → ${targetIndex + 1} (value ${m.lightTempValues[targetIndex]})`,
+    );
+  }
+
+  private async performTempCycle() {
+    const m = this.mapping;
+    const method = m.lightTempCycleMethod ?? 'dpsPulse';
+
+    if (method === 'dpsPulse' && m.lightTempCycleDps !== undefined) {
+      this.sendCommand(m.lightTempCycleDps, true);
+      await this.delay(DPS_PULSE_DELAY);
+      this.sendCommand(m.lightTempCycleDps, false);
+    } else if (method === 'lightToggle') {
+      this.sendCommand(m.lightPowerDps, false);
+      await this.delay(DPS_PULSE_DELAY);
+      this.sendCommand(m.lightPowerDps, true);
+    } else {
+      // Fallback: if no cycle DPS and method is dpsPulse, try light toggle
+      this.sendCommand(m.lightPowerDps, false);
+      await this.delay(DPS_PULSE_DELAY);
+      this.sendCommand(m.lightPowerDps, true);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  TIMER PRESET BUTTONS
+  // ════════════════════════════════════════════════════════════════
+
+  private setupTimerButtons() {
+    if (!this.features.enableTimerButtons || this.mapping.timerDps === undefined) {
+      // Remove previously cached timer switches
+      for (const val of (this.mapping.timerValues ?? [])) {
+        const existing = this.accessory.getService(`Timer ${val}h`);
+        if (existing) {
+          this.accessory.removeService(existing);
+        }
+      }
+      return;
+    }
+
+    const timerDps = this.mapping.timerDps;
+    const values = this.mapping.timerValues;
+
+    for (let i = 0; i < values.length; i++) {
+      const hours = values[i];
+      const name = `Timer ${hours}h`;
+      const subtype = `timer-preset-${hours}`;
+      const svc =
+        this.accessory.getService(name) ||
+        this.accessory.addService(this.platform.Service.Switch, name, subtype);
+      svc.setCharacteristic(this.Characteristic.Name, name);
+
+      svc
+        .getCharacteristic(this.Characteristic.On)
+        .onGet(() => false) // always off (momentary)
+        .onSet((value: CharacteristicValue) => {
+          if (value) {
+            this.sendCommand(timerDps, hours);
+            this.log.info(`[${this.deviceName}]`, `Timer set → ${hours}h`);
+            setTimeout(() => {
+              svc.updateCharacteristic(this.Characteristic.On, false);
+            }, MOMENTARY_RESET_DELAY);
+          }
+        });
+
+      this.timerSwitches.push(svc);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  CLEANUP
+  // ════════════════════════════════════════════════════════════════
+
+  /**
+   * Remove the legacy single Switch service that the old plugin used for
+   * "Toggle Light". Avoids orphaned services in HomeKit cache.
+   */
+  private cleanupLegacyServices() {
+    // The old code added a Switch service without a subtype for "Toggle Light".
+    // We now use subtyped switches for temp/timer, so remove the un-subtyped one.
+    const services = this.accessory.services.filter(
+      (s) =>
+        s.UUID === this.platform.Service.Switch.UUID &&
+        !s.subtype, // legacy switch had no subtype
+    );
+    for (const svc of services) {
+      this.log.info(`[${this.deviceName}]`, 'Removing legacy toggle switch service');
+      this.accessory.removeService(svc);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  UTILITIES
+  // ════════════════════════════════════════════════════════════════
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}

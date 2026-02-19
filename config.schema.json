@@ -1,0 +1,192 @@
+{
+  "pluginAlias": "HomebridgeCreateCeilingFan",
+  "pluginType": "platform",
+  "singular": true,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "required": true,
+        "default": "Create Ceiling Fan"
+      },
+      "pollingIntervalSeconds": {
+        "title": "Polling Interval (seconds)",
+        "type": "integer",
+        "default": 15,
+        "minimum": 5,
+        "description": "How often to poll the device for state changes (seconds). Set to 0 to disable polling (event-based only)."
+      },
+      "secrets": {
+        "title": "Secrets Configuration",
+        "type": "object",
+        "properties": {
+          "mode": {
+            "title": "Secrets Mode",
+            "type": "string",
+            "default": "inline",
+            "oneOf": [
+              { "title": "Inline (id/key in config)", "enum": ["inline"] },
+              { "title": "Environment Variables", "enum": ["env"] },
+              { "title": "Storage File", "enum": ["storage"] }
+            ],
+            "description": "How device credentials are provided."
+          },
+          "storageFile": {
+            "title": "Storage File Name",
+            "type": "string",
+            "default": "create-fan-secrets.json",
+            "description": "Filename inside Homebridge storage path (only used when mode is 'storage')."
+          }
+        }
+      },
+      "devices": {
+        "type": "array",
+        "title": "Fans",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "title": "Fan Name",
+              "description": "Name of the fan as it will appear in HomeKit.",
+              "required": true
+            },
+            "id": {
+              "type": "string",
+              "title": "Tuya Device ID",
+              "description": "Required when secrets mode is 'inline'."
+            },
+            "key": {
+              "type": "string",
+              "title": "Tuya Device Key",
+              "description": "Required when secrets mode is 'inline'."
+            },
+            "idEnv": {
+              "type": "string",
+              "title": "ID Environment Variable",
+              "description": "Name of env var containing the Tuya device ID (secrets mode 'env')."
+            },
+            "keyEnv": {
+              "type": "string",
+              "title": "Key Environment Variable",
+              "description": "Name of env var containing the Tuya device key (secrets mode 'env')."
+            },
+            "deviceKey": {
+              "type": "string",
+              "title": "Storage Lookup Key",
+              "description": "Stable key to look up in storage file if device name doesn't match."
+            },
+            "model": {
+              "type": "string",
+              "title": "Model",
+              "description": "Model name shown in HomeKit accessory info.",
+              "default": "CREATE Ceiling Fan"
+            },
+            "mapping": {
+              "title": "DPS Mapping",
+              "type": "object",
+              "properties": {
+                "fanPowerDps": {
+                  "type": "integer",
+                  "title": "Fan Power DPS",
+                  "default": 60
+                },
+                "fanSpeedDps": {
+                  "type": "integer",
+                  "title": "Fan Speed DPS",
+                  "default": 62
+                },
+                "fanDirectionDps": {
+                  "type": "integer",
+                  "title": "Fan Direction DPS",
+                  "description": "Leave empty if your fan has no direction control."
+                },
+                "fanSpeedMin": {
+                  "type": "integer",
+                  "title": "Fan Speed Min",
+                  "default": 1
+                },
+                "fanSpeedMax": {
+                  "type": "integer",
+                  "title": "Fan Speed Max",
+                  "default": 6
+                },
+                "lightPowerDps": {
+                  "type": "integer",
+                  "title": "Light Power DPS",
+                  "default": 20
+                },
+                "lightTempModeDps": {
+                  "type": "integer",
+                  "title": "Light Temp Mode DPS (direct write)",
+                  "description": "If your device has a writable DPS for setting light temperature directly."
+                },
+                "lightTempCycleDps": {
+                  "type": "integer",
+                  "title": "Light Temp Cycle DPS",
+                  "description": "DPS to pulse for cycling through light temperatures."
+                },
+                "lightTempCycleMethod": {
+                  "type": "string",
+                  "title": "Light Temp Cycle Method",
+                  "default": "dpsPulse",
+                  "oneOf": [
+                    { "title": "DPS Pulse (write true then false)", "enum": ["dpsPulse"] },
+                    { "title": "Light Toggle (off then on)", "enum": ["lightToggle"] }
+                  ]
+                },
+                "lightTempValues": {
+                  "type": "array",
+                  "title": "Light Temperature Values",
+                  "items": { "type": "integer" },
+                  "default": [1, 2, 3],
+                  "description": "Discrete temperature mode values the device cycles through."
+                },
+                "timerDps": {
+                  "type": "integer",
+                  "title": "Timer DPS",
+                  "description": "DPS for setting a timer. Leave empty to disable timer buttons."
+                },
+                "timerValues": {
+                  "type": "array",
+                  "title": "Timer Values (hours)",
+                  "items": { "type": "integer" },
+                  "default": [1, 2, 4],
+                  "description": "List of timer durations in hours."
+                }
+              }
+            },
+            "features": {
+              "title": "Feature Flags",
+              "type": "object",
+              "properties": {
+                "enableLight": {
+                  "type": "boolean",
+                  "title": "Enable Light",
+                  "default": true
+                },
+                "enableDirection": {
+                  "type": "boolean",
+                  "title": "Enable Direction Control",
+                  "description": "Defaults to true if fanDirectionDps is set."
+                },
+                "enableTimerButtons": {
+                  "type": "boolean",
+                  "title": "Enable Timer Buttons",
+                  "description": "Defaults to true if timerDps is set."
+                },
+                "enableTempButtons": {
+                  "type": "boolean",
+                  "title": "Enable Temperature Preset Buttons",
+                  "default": true
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
