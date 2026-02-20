@@ -40,9 +40,10 @@ export declare class FanAccessory {
     private updateSpeedButtons;
     private setLightOn;
     private setupTempButtons;
-    private activateTempPreset;
-    private performTempCycle;
+    private setTempPreset;
+    private updateTempButtons;
     private setupTimerButtons;
+    private updateTimerButtons;
     /**
      * Remove the legacy single Switch service that the old plugin used for
      * "Toggle Light". Avoids orphaned services in HomeKit cache.

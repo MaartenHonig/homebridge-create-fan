@@ -8,8 +8,6 @@ import {
 import { CreateFanPlatform } from './platform.js';
 import type { PlatformAccessoryContext, DpsMapping, FeatureFlags } from './types.js';
 import {
-  MOMENTARY_RESET_DELAY,
-  DPS_PULSE_DELAY,
   MAX_RECONNECT_DELAY,
   INITIAL_RECONNECT_DELAY,
 } from './settings.js';
@@ -46,6 +44,7 @@ export class FanAccessory {
     fanDirection: 0, // 0 = clockwise, 1 = counter-clockwise
     lightOn: false,
     currentTempIndex: 0, // index into lightTempValues
+    timerRemaining: 0,   // minutes remaining on timer
   };
 
   // Debounce: prevent re-entrant HomeKit updates within a window
@@ -299,13 +298,27 @@ export class FanAccessory {
       }
     }
 
-    // Light temperature mode (readable)
+    // Light temperature (direct value from DPS 23)
     if (m.lightTempModeDps !== undefined) {
-      const tempMode = dps[String(m.lightTempModeDps)];
-      if (tempMode !== undefined) {
-        const idx = m.lightTempValues.indexOf(Number(tempMode));
+      const tempVal = dps[String(m.lightTempModeDps)];
+      if (tempVal !== undefined) {
+        const idx = m.lightTempValues.indexOf(Number(tempVal));
         if (idx >= 0) {
           this.state.currentTempIndex = idx;
+        }
+        if (pushToHomeKit) {
+          this.updateTempButtons();
+        }
+      }
+    }
+
+    // Timer remaining (DPS 64 = minutes)
+    if (m.timerDps !== undefined) {
+      const timerVal = dps[String(m.timerDps)];
+      if (timerVal !== undefined) {
+        this.state.timerRemaining = Number(timerVal);
+        if (pushToHomeKit) {
+          this.updateTimerButtons();
         }
       }
     }
@@ -313,7 +326,8 @@ export class FanAccessory {
     this.log.debug(
       `[${this.deviceName}]`,
       `State: fan=${this.state.fanActive ? 'ON' : 'OFF'} speed=${this.state.fanSpeed} ` +
-      `light=${this.state.lightOn ? 'ON' : 'OFF'} temp=${this.state.currentTempIndex}`,
+      `light=${this.state.lightOn ? 'ON' : 'OFF'} temp=${this.state.currentTempIndex} ` +
+      `timer=${this.state.timerRemaining}m`,
     );
   }
 
@@ -446,7 +460,7 @@ export class FanAccessory {
     if (!this.features.enableTempButtons || !this.features.enableLight) {
       // Remove any previously cached temp switches
       for (let i = 0; i < 3; i++) {
-        const existing = this.accessory.getService(`Light Temp ${i + 1}`);
+        const existing = this.accessory.getServiceById(this.platform.Service.Switch, `temp-preset-${i}`);
         if (existing) {
           this.accessory.removeService(existing);
         }
@@ -454,83 +468,58 @@ export class FanAccessory {
       return;
     }
 
+    const labels = ['Warm', 'Neutral', 'Cool'];
     const values = this.mapping.lightTempValues;
     for (let i = 0; i < values.length; i++) {
-      const name = `Light Temp ${i + 1}`;
+      const name = labels[i] ?? `Temp ${i + 1}`;
       const subtype = `temp-preset-${i}`;
       const svc =
-        this.accessory.getService(name) ||
+        this.accessory.getServiceById(this.platform.Service.Switch, subtype) ||
         this.accessory.addService(this.platform.Service.Switch, name, subtype);
       svc.setCharacteristic(this.Characteristic.Name, name);
 
+      const targetIndex = i;
       svc
         .getCharacteristic(this.Characteristic.On)
-        .onGet(() => false) // always off (momentary)
+        .onGet(() => this.state.lightOn && this.state.currentTempIndex === targetIndex)
         .onSet((value: CharacteristicValue) => {
           if (value) {
-            this.activateTempPreset(i, svc);
+            this.setTempPreset(targetIndex);
           }
+          // Ignore off — we update buttons via updateTempButtons
         });
 
       this.tempSwitches.push(svc);
     }
   }
 
-  private async activateTempPreset(targetIndex: number, svc: Service) {
+  private setTempPreset(targetIndex: number) {
     const m = this.mapping;
+    const value = m.lightTempValues[targetIndex];
 
-    // Method A: Direct mode DPS
+    // Turn light on if needed
+    if (!this.state.lightOn) {
+      this.state.lightOn = true;
+      this.sendCommand(m.lightPowerDps, true);
+      if (this.lightService) {
+        this.lightService.updateCharacteristic(this.Characteristic.On, true);
+      }
+    }
+
+    // Direct write to temp DPS
     if (m.lightTempModeDps !== undefined) {
-      this.sendCommand(m.lightTempModeDps, m.lightTempValues[targetIndex]);
-      this.state.currentTempIndex = targetIndex;
-    }
-    // Method B: Cycle
-    else {
-      const totalModes = m.lightTempValues.length;
-      let cyclesToDo = (targetIndex - this.state.currentTempIndex + totalModes) % totalModes;
-      if (cyclesToDo === 0) {
-        cyclesToDo = totalModes; // full cycle to re-apply same mode
-      }
-      const maxCycles = totalModes; // safety cap
-      cyclesToDo = Math.min(cyclesToDo, maxCycles);
-
-      for (let c = 0; c < cyclesToDo; c++) {
-        await this.performTempCycle();
-        if (c < cyclesToDo - 1) {
-          await this.delay(DPS_PULSE_DELAY);
-        }
-      }
-      this.state.currentTempIndex = targetIndex;
+      this.sendCommand(m.lightTempModeDps, value);
     }
 
-    // Reset momentary switch
-    setTimeout(() => {
-      svc.updateCharacteristic(this.Characteristic.On, false);
-    }, MOMENTARY_RESET_DELAY);
-
-    this.log.debug(
-      `[${this.deviceName}]`,
-      `Temp preset → ${targetIndex + 1} (value ${m.lightTempValues[targetIndex]})`,
-    );
+    this.state.currentTempIndex = targetIndex;
+    this.updateTempButtons();
+    this.log.debug(`[${this.deviceName}]`, `setTemp → ${['Warm', 'Neutral', 'Cool'][targetIndex]} (${value})`);
   }
 
-  private async performTempCycle() {
-    const m = this.mapping;
-    const method = m.lightTempCycleMethod ?? 'dpsPulse';
-
-    if (method === 'dpsPulse' && m.lightTempCycleDps !== undefined) {
-      this.sendCommand(m.lightTempCycleDps, true);
-      await this.delay(DPS_PULSE_DELAY);
-      this.sendCommand(m.lightTempCycleDps, false);
-    } else if (method === 'lightToggle') {
-      this.sendCommand(m.lightPowerDps, false);
-      await this.delay(DPS_PULSE_DELAY);
-      this.sendCommand(m.lightPowerDps, true);
-    } else {
-      // Fallback: if no cycle DPS and method is dpsPulse, try light toggle
-      this.sendCommand(m.lightPowerDps, false);
-      await this.delay(DPS_PULSE_DELAY);
-      this.sendCommand(m.lightPowerDps, true);
+  private updateTempButtons() {
+    for (let i = 0; i < this.tempSwitches.length; i++) {
+      const isActive = this.state.lightOn && this.state.currentTempIndex === i;
+      this.tempSwitches[i].updateCharacteristic(this.Characteristic.On, isActive);
     }
   }
 
@@ -542,7 +531,7 @@ export class FanAccessory {
     if (!this.features.enableTimerButtons || this.mapping.timerDps === undefined) {
       // Remove previously cached timer switches
       for (const val of (this.mapping.timerValues ?? [])) {
-        const existing = this.accessory.getService(`Timer ${val}h`);
+        const existing = this.accessory.getServiceById(this.platform.Service.Switch, `timer-preset-${val}`);
         if (existing) {
           this.accessory.removeService(existing);
         }
@@ -554,28 +543,44 @@ export class FanAccessory {
     const values = this.mapping.timerValues;
 
     for (let i = 0; i < values.length; i++) {
-      const hours = values[i];
-      const name = `Timer ${hours}h`;
-      const subtype = `timer-preset-${hours}`;
+      const minutes = values[i];
+      const label = minutes >= 60 ? `Timer ${Math.round(minutes / 60)}h` : `Timer ${minutes}m`;
+      const subtype = `timer-preset-${minutes}`;
       const svc =
-        this.accessory.getService(name) ||
-        this.accessory.addService(this.platform.Service.Switch, name, subtype);
-      svc.setCharacteristic(this.Characteristic.Name, name);
+        this.accessory.getServiceById(this.platform.Service.Switch, subtype) ||
+        this.accessory.addService(this.platform.Service.Switch, label, subtype);
+      svc.setCharacteristic(this.Characteristic.Name, label);
 
+      const timerMinutes = minutes;
       svc
         .getCharacteristic(this.Characteristic.On)
-        .onGet(() => false) // always off (momentary)
+        .onGet(() => this.state.timerRemaining === timerMinutes)
         .onSet((value: CharacteristicValue) => {
           if (value) {
-            this.sendCommand(timerDps, hours);
-            this.log.info(`[${this.deviceName}]`, `Timer set → ${hours}h`);
-            setTimeout(() => {
-              svc.updateCharacteristic(this.Characteristic.On, false);
-            }, MOMENTARY_RESET_DELAY);
+            this.sendCommand(timerDps, timerMinutes);
+            this.state.timerRemaining = timerMinutes;
+            this.updateTimerButtons();
+            this.log.info(`[${this.deviceName}]`, `Timer set → ${timerMinutes} min`);
+          } else {
+            // Toggle off = cancel timer
+            if (this.state.timerRemaining === timerMinutes) {
+              this.sendCommand(timerDps, 0);
+              this.state.timerRemaining = 0;
+              this.updateTimerButtons();
+              this.log.info(`[${this.deviceName}]`, 'Timer cancelled');
+            }
           }
         });
 
       this.timerSwitches.push(svc);
+    }
+  }
+
+  private updateTimerButtons() {
+    for (let i = 0; i < this.timerSwitches.length; i++) {
+      const minutes = this.mapping.timerValues[i];
+      const isActive = this.state.timerRemaining === minutes;
+      this.timerSwitches[i].updateCharacteristic(this.Characteristic.On, isActive);
     }
   }
 

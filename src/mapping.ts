@@ -5,11 +5,14 @@ import type { DpsMapping, FeatureFlags, DeviceConfig } from './types.js';
 const DEFAULT_MAPPING: DpsMapping = {
   fanPowerDps: 60,
   fanSpeedDps: 62,
+  fanDirectionDps: 63,
   fanSpeedMin: 1,
   fanSpeedMax: 6,
   lightPowerDps: 20,
-  lightTempValues: [1, 2, 3],
-  timerValues: [1, 2, 4],
+  lightTempModeDps: 23,
+  lightTempValues: [0, 500, 1000],  // warm, neutral, cool (DPS 23 values)
+  timerDps: 64,
+  timerValues: [59, 119, 239],      // minutes (≈1h, 2h, 4h)
 };
 
 export function resolveMapping(partial?: Partial<DpsMapping>): DpsMapping {

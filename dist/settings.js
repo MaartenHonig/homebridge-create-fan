@@ -6,8 +6,8 @@ export const PLATFORM_NAME = 'HomebridgeCreateFan';
  * Must match the "name" field in package.json.
  */
 export const PLUGIN_NAME = 'homebridge-createfan';
-/** Default polling interval in seconds */
-export const DEFAULT_POLLING_INTERVAL = 15;
+/** Default polling interval in seconds (0 = disabled, events only) */
+export const DEFAULT_POLLING_INTERVAL = 0;
 /** Delay before resetting momentary switch to off (ms) */
 export const MOMENTARY_RESET_DELAY = 500;
 /** Delay between DPS pulse writes (ms) */
