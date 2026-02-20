@@ -455,7 +455,7 @@ export class FanAccessory {
         const values = this.mapping.timerValues;
         for (let i = 0; i < values.length; i++) {
             const minutes = values[i];
-            const label = minutes >= 60 ? `Timer ${Math.round(minutes / 60)}h` : `Timer ${minutes}m`;
+            const label = minutes >= 45 ? `Timer ${Math.round(minutes / 60)}h` : `Timer ${minutes}m`;
             const subtype = `timer-preset-${minutes}`;
             const svc = this.accessory.getServiceById(this.platform.Service.Switch, subtype) ||
                 this.accessory.addService(this.platform.Service.Switch, label, subtype);
