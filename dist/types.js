@@ -1,5 +1,5 @@
 /**
- * Types for the homebridge-create-fan plugin.
+ * Types for the homebridge-createfan plugin.
  */
 export {};
 //# sourceMappingURL=types.js.map

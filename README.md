@@ -1,4 +1,4 @@
-# homebridge-create-fan
+# homebridge-createfan
 
 Control your CREATE ceiling fan from Apple HomeKit via Homebridge.
 
@@ -14,12 +14,12 @@ Control your CREATE ceiling fan from Apple HomeKit via Homebridge.
 
 ## Installation
 
-Go to the Homebridge UI → Plugins → search for `homebridge-create-fan` → Install.
+Go to the Homebridge UI → Plugins → search for `homebridge-createfan` → Install.
 
 Or install manually:
 
 ```bash
-npm install -g homebridge-create-fan
+npm install -g homebridge-createfan
 ```
 
 ---

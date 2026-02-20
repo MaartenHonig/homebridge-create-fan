@@ -5,7 +5,7 @@ export declare const PLATFORM_NAME = "HomebridgeCreateFan";
 /**
  * Must match the "name" field in package.json.
  */
-export declare const PLUGIN_NAME = "homebridge-create-fan";
+export declare const PLUGIN_NAME = "homebridge-createfan";
 /** Default polling interval in seconds */
 export declare const DEFAULT_POLLING_INTERVAL = 15;
 /** Delay before resetting momentary switch to off (ms) */

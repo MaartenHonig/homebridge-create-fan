@@ -6,7 +6,7 @@ export const PLATFORM_NAME = 'HomebridgeCreateFan';
 /**
  * Must match the "name" field in package.json.
  */
-export const PLUGIN_NAME = 'homebridge-create-fan';
+export const PLUGIN_NAME = 'homebridge-createfan';
 
 /** Default polling interval in seconds */
 export const DEFAULT_POLLING_INTERVAL = 15;

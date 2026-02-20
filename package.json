@@ -1,5 +1,5 @@
 {
-  "name": "homebridge-create-fan",
+  "name": "homebridge-createfan",
   "displayName": "Homebridge CREATE Fan",
   "type": "module",
   "version": "0.1.0",
@@ -9,10 +9,10 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/YOUR_USERNAME/homebridge-create-fan.git"
+    "url": "https://github.com/YOUR_USERNAME/homebridge-createfan.git"
   },
   "bugs": {
-    "url": "https://github.com/YOUR_USERNAME/homebridge-create-fan/issues"
+    "url": "https://github.com/YOUR_USERNAME/homebridge-createfan/issues"
   },
   "keywords": [
     "homebridge-plugin",
